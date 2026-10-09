@@ -53,10 +53,15 @@ impl ConnectionError {
     }
 
     pub(crate) fn no_connect(quic_connection: &quinn::Connection) -> Self {
-        quic_connection
-            .close_reason()
-            .expect("QUIC connection is still alive on close-cast")
-            .into()
+        match quic_connection.close_reason() {
+            Some(reason) => reason.into(),
+            None => {
+                // Connection still alive but driver reported NotConnected.
+                // This race condition can occur when driver threads are processing
+                // incoming streams while connection cleanup is triggered.
+                ConnectionError::LocallyClosed
+            }
+        }
     }
 
     pub(crate) fn local_h3_error(error_code: ErrorCode) -> Self {
@@ -116,12 +121,15 @@ pub enum ConnectingError {
 
 impl ConnectingError {
     pub(crate) fn with_no_connection(quic_connection: &quinn::Connection) -> Self {
-        ConnectingError::ConnectionError(
-            quic_connection
-                .close_reason()
-                .expect("QUIC connection is still alive on close-cast")
-                .into(),
-        )
+        ConnectingError::ConnectionError(match quic_connection.close_reason() {
+            Some(reason) => reason.into(),
+            None => {
+                // Connection still alive but error reported.
+                // This race condition can occur when driver threads are processing
+                // incoming streams while connection cleanup is triggered.
+                ConnectionError::LocallyClosed
+            }
+        })
     }
 
     pub(crate) fn with_connect_error(error: quinn::ConnectError) -> Self {
@@ -342,3 +350,54 @@ impl Display for QuicProtoError {
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
 #[error("cannot derive keying material as requested output length is too large")]
 pub struct ExportKeyingMaterialError;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_session_stream_on_live_quic_returns_rejection_not_panic() {
+        let identity = crate::Identity::self_signed(["localhost"]).unwrap();
+        let hash = identity.certificate_chain().as_slice()[0].hash();
+        let server_config = crate::ServerConfig::builder()
+            .with_bind_default(0)
+            .with_identity(identity)
+            .build();
+        let client_config = crate::ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([hash])
+            .build();
+        let server =
+            quinn::Endpoint::server(server_config.quic_config, "127.0.0.1:0".parse().unwrap())
+                .unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config.quic_config);
+        let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                client
+                    .connect(server.local_addr().unwrap(), "localhost")
+                    .unwrap(),
+                async { server.accept().await.unwrap().await }
+            )
+        })
+        .await
+        .unwrap();
+        let client = client.unwrap();
+        let server = server.unwrap();
+        assert!(client.close_reason().is_none());
+        assert!(matches!(
+            ConnectingError::with_no_connection(&client),
+            ConnectingError::ConnectionError(ConnectionError::LocallyClosed)
+        ));
+        assert_eq!(
+            ConnectionError::no_connect(&client),
+            ConnectionError::LocallyClosed
+        );
+        client.close(0u32.into(), b"test done");
+        assert!(matches!(
+            ConnectingError::with_no_connection(&client),
+            ConnectingError::ConnectionError(ConnectionError::LocallyClosed)
+        ));
+        drop(server);
+    }
+}
